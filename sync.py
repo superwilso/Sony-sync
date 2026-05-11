@@ -136,14 +136,16 @@ DEFAULT_LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
 DEFAULT_LASTFM_API_SECRET = os.environ.get("LASTFM_API_SECRET", "")
 DEFAULT_LASTFM_USERNAME = os.environ.get("LASTFM_USERNAME", "")
 DEFAULT_LASTFM_SESSION_KEY = os.environ.get("LASTFM_SESSION_KEY", "")
-DEFAULT_INTERNAL_MAX_GB = 52
+DEFAULT_INTERNAL_MAX_GB = 54
 DEFAULT_INTERNAL_SAFETY_BUFFER_GB = 0
 DEFAULT_SD_MAX_GB = 32
+DEFAULT_EXCLUDED_ALBUMS = os.environ.get("SYNC_EXCLUDED_ALBUMS", "")
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 
 # Supported audio extensions
 AUDIO_EXT = (".flac", ".wav", ".mp3", ".m4a", ".aac", ".alac")
 PLAYLIST_EXT = (".m3u", ".m3u8")
+ALBUM_SELECTION_PAGE_SIZE = 15
 # =======================================================
 
 
@@ -163,6 +165,7 @@ class AppConfig:
     internal_max_gb: float = DEFAULT_INTERNAL_MAX_GB
     internal_safety_buffer_gb: float = DEFAULT_INTERNAL_SAFETY_BUFFER_GB
     sd_max_gb: float = DEFAULT_SD_MAX_GB
+    excluded_albums: str = DEFAULT_EXCLUDED_ALBUMS
 
     @property
     def internal_max_bytes(self) -> int:
@@ -177,6 +180,10 @@ class AppConfig:
     def sd_max_bytes(self) -> int:
         return int(self.sd_max_gb * 1024 * 1024 * 1024)
 
+    @property
+    def excluded_album_entries(self) -> list[str]:
+        return parse_album_exclusion_entries(self.excluded_albums)
+
 
 @dataclass
 class SyncResult:
@@ -189,6 +196,7 @@ class SyncResult:
     scrobble_logs_cleared: int = 0
     artists_internal: int = 0
     artists_sd: int = 0
+    artists_excluded: int = 0
     artists_skipped: int = 0
     skipped_entries: int = 0
     logs: list[str] = field(default_factory=list)
@@ -209,6 +217,7 @@ class LibraryPlan:
     playlist_drive: dict[str, str]
     folder_sizes: dict[str, int]
     folder_playlists: dict[str, set[str]]
+    excluded_folders: set[str]
 
 
 @dataclass
@@ -713,6 +722,71 @@ def canonical_folder_key(name: str) -> str:
     return " ".join(normalized.split()).casefold()
 
 
+def parse_album_exclusion_entries(raw_value: str) -> list[str]:
+    entries: list[str] = []
+    seen: set[str] = set()
+    normalized = raw_value.replace(";", "\n").replace(",", "\n")
+    for raw_entry in normalized.splitlines():
+        entry = " ".join(raw_entry.strip().split())
+        if not entry:
+            continue
+        entry_key = canonical_folder_key(entry)
+        if entry_key in seen:
+            continue
+        seen.add(entry_key)
+        entries.append(entry)
+    return entries
+
+
+def format_album_exclusion_summary(entries: list[str], limit: int = 3) -> str:
+    if not entries:
+        return "(none)"
+    preview = ", ".join(entries[:limit])
+    if len(entries) > limit:
+        return f"{preview}, ... ({len(entries)} total)"
+    return preview
+
+
+def resolve_excluded_source_folders(
+    source_folders: set[str],
+    config: AppConfig,
+    result: SyncResult | None = None,
+) -> set[str]:
+    configured_entries = config.excluded_album_entries
+    if not configured_entries:
+        return set()
+
+    source_lookup = {
+        canonical_folder_key(folder_name): folder_name
+        for folder_name in source_folders
+    }
+    excluded_folders: set[str] = set()
+    missing_entries: list[str] = []
+
+    for entry in configured_entries:
+        matched_folder = source_lookup.get(canonical_folder_key(entry))
+        if matched_folder is None:
+            missing_entries.append(entry)
+            continue
+        excluded_folders.add(matched_folder)
+
+    if result is not None:
+        if excluded_folders:
+            summary = format_album_exclusion_summary(
+                sorted(excluded_folders, key=str.lower),
+                limit=6,
+            )
+            result.log(f"Album exclusions active: {summary}")
+        if missing_entries:
+            summary = format_album_exclusion_summary(
+                sorted(missing_entries, key=str.lower),
+                limit=6,
+            )
+            result.log(f"Configured exclusions not found in source: {summary}")
+
+    return excluded_folders
+
+
 def choose_preferred_folder(source_dir: str, folder_names: list[str]) -> str:
     def folder_score(folder_name: str) -> tuple[int, int, str]:
         folder_path = os.path.join(source_dir, folder_name)
@@ -872,6 +946,10 @@ def build_library_plan(config: AppConfig, result: SyncResult) -> LibraryPlan | N
         return None
 
     source_artists = set(resolve_source_folders(config.source_dir, result))
+    excluded_folders = resolve_excluded_source_folders(source_artists, config, result)
+    if excluded_folders:
+        result.artists_excluded = len(excluded_folders)
+        source_artists -= excluded_folders
     folder_sizes = {
         folder: get_dir_size(os.path.join(config.source_dir, folder))
         for folder in source_artists
@@ -969,6 +1047,7 @@ def build_library_plan(config: AppConfig, result: SyncResult) -> LibraryPlan | N
         playlist_drive=playlist_drive,
         folder_sizes=folder_sizes,
         folder_playlists=folder_playlists,
+        excluded_folders=excluded_folders,
     )
 
 
@@ -1254,13 +1333,13 @@ def process_playlist(
         progress.step(f"Processing playlist {playlist_name}")
 
 
-def count_sync_steps(config: AppConfig) -> int:
+def count_sync_steps(config: AppConfig, plan: LibraryPlan) -> int:
     file_steps = 0
-    for artist_folder in list_artist_folders(config.source_dir):
+    for artist_folder in plan.assignments:
         artist_path = os.path.join(config.source_dir, artist_folder)
         for _, _, files in os.walk(artist_path):
             file_steps += len(files)
-    return file_steps + len(list_playlist_files(config.playlist_dir))
+    return file_steps + len(plan.playlist_names)
 
 
 def sync_library(
@@ -1279,7 +1358,7 @@ def sync_library(
     stale_music_files = iter_stale_music_files(config, plan)
     stale_playlists = iter_stale_playlists(config, plan)
     progress = ProgressTracker(
-        count_sync_steps(config) + len(stale_music_files) + len(stale_playlists),
+        count_sync_steps(config, plan) + len(stale_music_files) + len(stale_playlists),
         progress_callback,
     )
 
@@ -1588,6 +1667,223 @@ def prompt_path(label: str, current_value: str) -> str:
     return prompt_text(label, current_value, secret=False)
 
 
+def album_matches_query(album_name: str, query: str) -> bool:
+    if not query:
+        return True
+    normalized_query = canonical_folder_key(query)
+    normalized_album = canonical_folder_key(album_name)
+    return normalized_query in normalized_album
+
+
+def list_selectable_album_folders(source_dir: str) -> tuple[list[str], list[str]]:
+    if not os.path.isdir(source_dir):
+        return [], [f"Source directory does not exist: {source_dir}"]
+    probe_result = SyncResult()
+    folders = resolve_source_folders(source_dir, probe_result)
+    return folders, probe_result.logs
+
+
+def parse_album_selection_indexes(raw_value: str, max_index: int) -> tuple[list[int], str | None]:
+    indexes: list[int] = []
+    seen: set[int] = set()
+    tokens = raw_value.replace(",", " ").split()
+    if not tokens:
+        return [], "Enter album numbers, a command, or 'done'."
+
+    for token in tokens:
+        if "-" in token:
+            left, right = token.split("-", 1)
+            if not left.isdigit() or not right.isdigit():
+                return [], f"Invalid range: {token}"
+            start = int(left)
+            end = int(right)
+            if start > end:
+                start, end = end, start
+            if start < 1 or end > max_index:
+                return [], f"Selection out of range: {token}"
+            for index in range(start, end + 1):
+                if index not in seen:
+                    seen.add(index)
+                    indexes.append(index)
+            continue
+
+        if not token.isdigit():
+            return [], f"Invalid selection: {token}"
+        index = int(token)
+        if index < 1 or index > max_index:
+            return [], f"Selection out of range: {token}"
+        if index not in seen:
+            seen.add(index)
+            indexes.append(index)
+
+    return indexes, None
+
+
+def prompt_album_exclusions(current_value: str, source_dir: str) -> str:
+    current_entries = parse_album_exclusion_entries(current_value)
+    available_albums, discovery_logs = list_selectable_album_folders(source_dir)
+    if not available_albums:
+        print("Select excluded albums")
+        print("======================")
+        print("No albums are available to select.")
+        for line in discovery_logs[:5]:
+            print(line)
+        pause()
+        return current_value
+
+    available_lookup = {
+        canonical_folder_key(album_name): album_name
+        for album_name in available_albums
+    }
+    selected_albums = {
+        available_lookup[canonical_folder_key(entry)]
+        for entry in current_entries
+        if canonical_folder_key(entry) in available_lookup
+    }
+    missing_entries = sorted(
+        [
+            entry for entry in current_entries
+            if canonical_folder_key(entry) not in available_lookup
+        ],
+        key=str.lower,
+    )
+    search_query = ""
+    page = 0
+    status_message = ""
+
+    while True:
+        filtered_albums = [
+            album_name for album_name in available_albums
+            if album_matches_query(album_name, search_query)
+        ]
+        total_matches = len(filtered_albums)
+        total_pages = max((total_matches - 1) // ALBUM_SELECTION_PAGE_SIZE + 1, 1)
+        page = min(page, total_pages - 1)
+        page_start = page * ALBUM_SELECTION_PAGE_SIZE
+        page_end = page_start + ALBUM_SELECTION_PAGE_SIZE
+        visible_albums = filtered_albums[page_start:page_end]
+
+        clear_screen()
+        print("Select excluded albums")
+        print("======================")
+        print(f"Source: {source_dir}")
+        print(f"Selected: {len(selected_albums)} of {len(available_albums)} album(s)")
+        print(f"Search: {search_query or '(all albums)'}")
+        if discovery_logs:
+            print(f"Library notes: {len(discovery_logs)} duplicate-name issue(s) were auto-resolved.")
+        if missing_entries:
+            print(
+                "Saved exclusions not found in source: "
+                f"{format_album_exclusion_summary(missing_entries, limit=6)}"
+            )
+        print(
+            f"Showing {page_start + 1 if total_matches else 0}-"
+            f"{page_start + len(visible_albums)} of {total_matches} match(es)"
+            f" | page {page + 1}/{total_pages}"
+        )
+        print()
+
+        if visible_albums:
+            for offset, album_name in enumerate(visible_albums, start=1):
+                marker = "x" if album_name in selected_albums else " "
+                print(f"{offset:>2}. [{marker}] {album_name}")
+        else:
+            print("No albums match the current search.")
+
+        print()
+        print("Commands: numbers to toggle, 'search <text>' or '/text' to search, '/' to clear search,")
+        print("'all' to select matches on this page, 'none' to clear matches on this page,")
+        print("'clear' to remove every selection, 'next'/'prev' to change page,")
+        print("'done' to save, 'cancel' to keep the current exclusions.")
+        if status_message:
+            print(f"\n{status_message}")
+
+        command = input("\nSelection: ").strip()
+        lowered = command.casefold()
+
+        if lowered in {"done", "save"}:
+            return ", ".join(sorted(selected_albums, key=str.lower))
+        if lowered in {"cancel", "back", "quit"}:
+            return current_value
+        if lowered == "":
+            status_message = "Enter album numbers, a command, or 'done'."
+            continue
+        if lowered == "/":
+            search_query = ""
+            page = 0
+            status_message = "Search cleared."
+            continue
+        if command.startswith("/"):
+            search_query = command[1:].strip()
+            page = 0
+            status_message = (
+                f"Showing matches for '{search_query}'."
+                if search_query else
+                "Search cleared."
+            )
+            continue
+        if lowered.startswith("search "):
+            search_query = command[7:].strip()
+            page = 0
+            status_message = (
+                f"Showing matches for '{search_query}'."
+                if search_query else
+                "Search cleared."
+            )
+            continue
+        if lowered in {"next", "n"}:
+            if page + 1 < total_pages:
+                page += 1
+                status_message = ""
+            else:
+                status_message = "You are already on the last page."
+            continue
+        if lowered in {"prev", "p", "previous"}:
+            if page > 0:
+                page -= 1
+                status_message = ""
+            else:
+                status_message = "You are already on the first page."
+            continue
+        if lowered == "all":
+            if not visible_albums:
+                status_message = "There are no visible albums to select."
+                continue
+            selected_albums.update(visible_albums)
+            status_message = f"Selected {len(visible_albums)} album(s) on this page."
+            continue
+        if lowered == "none":
+            if not visible_albums:
+                status_message = "There are no visible albums to clear."
+                continue
+            cleared = sum(1 for album_name in visible_albums if album_name in selected_albums)
+            selected_albums.difference_update(visible_albums)
+            status_message = f"Cleared {cleared} album(s) on this page."
+            continue
+        if lowered == "clear":
+            if not selected_albums:
+                status_message = "No albums are currently selected."
+                continue
+            selected_albums.clear()
+            status_message = "Cleared every excluded album."
+            continue
+
+        indexes, error_message = parse_album_selection_indexes(command, len(visible_albums))
+        if error_message:
+            status_message = error_message
+            continue
+
+        toggled = 0
+        for index in indexes:
+            album_name = visible_albums[index - 1]
+            if album_name in selected_albums:
+                selected_albums.remove(album_name)
+            else:
+                selected_albums.add(album_name)
+            toggled += 1
+        status_message = f"Toggled {toggled} album(s)."
+
+
 def prompt_float(label: str, current_value: float) -> float:
     print(label)
     print(f"Current: {current_value}")
@@ -1872,6 +2168,7 @@ def render_dashboard(config: AppConfig, report: ScanReport) -> None:
     source_size = human_size(get_dir_size(config.source_dir))
     internal_size = human_size(get_dir_size(config.internal_drive))
     sd_size = human_size(get_dir_size(config.sd_drive))
+    excluded_summary = format_album_exclusion_summary(config.excluded_album_entries)
     scrobble_log_count = count_scrobble_logs(config)
     pending_scrobbles = count_pending_scrobbles(config)
     skipped_scrobbles = sum(
@@ -1889,6 +2186,7 @@ def render_dashboard(config: AppConfig, report: ScanReport) -> None:
     print(f" Internal music : {config.internal_drive} ({internal_size} used / {config.internal_max_gb:.1f} GB)")
     print(f" SD card music  : {config.sd_drive} ({sd_size} used / {config.sd_max_gb:.1f} GB)")
     print(f" Source size    : {source_size}")
+    print(f" Excluded albums: {excluded_summary}")
     print(
         f" Internal budget: {human_size(config.internal_music_budget_bytes)}"
         f" after {config.internal_safety_buffer_gb:.1f} GB buffer"
@@ -1924,6 +2222,7 @@ def render_dashboard(config: AppConfig, report: ScanReport) -> None:
     print(" Scan snapshot")
     print(f"  Albums to internal : {report.result.artists_internal}")
     print(f"  Albums to SD card  : {report.result.artists_sd}")
+    print(f"  Albums excluded    : {report.result.artists_excluded}")
     print(f"  Albums skipped     : {report.result.artists_skipped}")
     print(f"  Albums to add      : {report.albums_to_add}")
     print(f"  Albums to remove   : {report.albums_to_remove}")
@@ -1960,6 +2259,7 @@ def render_result(title: str, result: SyncResult) -> None:
     safe_print(f"Logs cleared       : {result.scrobble_logs_cleared}")
     safe_print(f"Folders to internal: {result.artists_internal}")
     safe_print(f"Folders to SD card : {result.artists_sd}")
+    safe_print(f"Folders excluded   : {result.artists_excluded}")
     safe_print(f"Folders skipped    : {result.artists_skipped}")
     safe_print(f"Skipped entries    : {result.skipped_entries}")
     safe_print("\nActivity log")
@@ -2115,6 +2415,7 @@ def render_preview_summary(config: AppConfig, report: ScanReport) -> None:
 
     print(f"Albums to internal : {report.result.artists_internal}")
     print(f"Albums to SD card  : {report.result.artists_sd}")
+    print(f"Albums excluded    : {report.result.artists_excluded}")
     print(f"Albums skipped     : {report.result.artists_skipped}")
     print(f"Albums to add      : {report.albums_to_add}")
     print(f"Albums to remove   : {report.albums_to_remove}")
@@ -2162,7 +2463,8 @@ def edit_sync_settings(config: AppConfig) -> None:
         print("6. Edit internal storage limit")
         print("7. Edit internal safety buffer")
         print("8. Edit SD storage limit")
-        print("9. Back")
+        print("9. Select excluded albums")
+        print("10. Back")
         choice = input("\nSelect an option: ").strip()
 
         if choice == "1":
@@ -2204,6 +2506,19 @@ def edit_sync_settings(config: AppConfig) -> None:
             config.sd_max_gb = prompt_float("Change SD storage limit (GB)", config.sd_max_gb)
             continue
         if choice == "9":
+            clear_screen()
+            updated_value = prompt_album_exclusions(config.excluded_albums, config.source_dir)
+            if updated_value == config.excluded_albums:
+                continue
+            config.excluded_albums = updated_value
+            try:
+                save_env_value("SYNC_EXCLUDED_ALBUMS", updated_value)
+                print("Saved excluded albums to .env")
+            except OSError as exc:
+                print(f"Updated excluded albums, but could not save to .env: {exc}")
+            pause()
+            continue
+        if choice == "10":
             return
         print("Invalid selection.")
         pause()

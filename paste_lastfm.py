@@ -30,7 +30,7 @@ from urllib import error, parse, request
 
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
-DEFAULT_GEMINI_MODEL = "gemini-flash-lite-latest"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 
 
 # ---------------------------------------------------------------------------
@@ -967,7 +967,7 @@ def resolve_start_time(arg_value: str | None) -> dt.datetime | None:
     return parse_start_time(arg_value)
 
 
-def preview_entries(entries: list[TrackEntry]) -> None:
+def preview_entries(entries: list[TrackEntry], main_artist_only: bool = False) -> None:
     print("\nPreview")
     print("-" * 72)
     for entry in entries:
@@ -975,7 +975,10 @@ def preview_entries(entries: list[TrackEntry]) -> None:
             "%Y-%m-%d %H:%M:%S"
         )
         duration = f"{entry.duration}s" if entry.duration else "unknown"
-        print(f"{played_at} | {entry.artist} - {entry.title} | duration {duration}")
+        artist, title = format_artist_title_for_scrobble(
+            entry.artist, entry.title, main_artist_only
+        )
+        print(f"{played_at} | {artist} - {title} | duration {duration}")
     print("-" * 72)
     print(f"{len(entries)} track(s) ready.")
 
@@ -988,6 +991,29 @@ def iter_batches(entries: list[TrackEntry], batch_size: int = 50) -> list[list[T
     return [entries[i : i + batch_size] for i in range(0, len(entries), batch_size)]
 
 
+def format_artist_title_for_scrobble(
+    raw_artist: str, raw_title: str, main_artist_only: bool = False
+) -> tuple[str, str]:
+    """Spotify-shape output so Last.fm links each featured artist separately.
+
+    - artist field: comma-joined "Main, Featured" (multi-artist tag)
+    - title field: appended "(feat. Featured)" for MusicBrainz match
+    With --main-artist-only: drop featured entirely.
+    """
+    main, featured = extract_featured_artist(raw_artist)
+    if not featured:
+        return raw_artist, raw_title
+    if main_artist_only:
+        return main, raw_title
+    # Don't double-append if title already has (feat./ft.)
+    if re.search(r"\(\s*(ft|feat)\.?", raw_title, re.IGNORECASE):
+        title_out = raw_title
+    else:
+        title_out = f"{raw_title} (feat. {featured})"
+    artist_out = f"{main}, {featured}"
+    return artist_out, title_out
+
+
 def submit_scrobble_batch(
     entries: list[TrackEntry], config: LastfmConfig, main_artist_only: bool = False
 ) -> tuple[int, int]:
@@ -997,11 +1023,11 @@ def submit_scrobble_batch(
         "sk": config.session_key,
     }
     for index, entry in enumerate(entries):
-        artist = entry.artist
-        if main_artist_only:
-            artist, _ = extract_featured_artist(artist)
+        artist, title = format_artist_title_for_scrobble(
+            entry.artist, entry.title, main_artist_only
+        )
         params[f"artist[{index}]"] = artist
-        params[f"track[{index}]"] = entry.title
+        params[f"track[{index}]"] = title
         params[f"timestamp[{index}]"] = str(entry.timestamp)
         if entry.duration > 0:
             params[f"duration[{index}]"] = str(entry.duration)
@@ -1128,7 +1154,7 @@ def main() -> int:
         for entry in entries:
             entry.timestamp = start_unix + entry.offset_seconds
 
-        preview_entries(entries)
+        preview_entries(entries, args.main_artist_only)
 
         confirm = input("\nUpload these plays to Last.fm? [y/N]: ").strip().lower()
         if confirm == "y":

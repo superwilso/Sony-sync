@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import paste_lastfm; r=paste_lastfm.format_artist_title_for_scrobble\\('Cosmo's Midnight ft. KUCKA', 'Chance On You'\\); print\\(r\\)\")",
+      "WebFetch(domain:www.last.fm)",
+      "Bash(PYTHONIOENCODING=utf-8 python -)"
+    ]
+  }
+}

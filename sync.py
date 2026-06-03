@@ -8,6 +8,8 @@ import getpass
 import ctypes
 import time
 import unicodedata
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -146,6 +148,8 @@ LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 AUDIO_EXT = (".flac", ".wav", ".mp3", ".m4a", ".aac", ".alac")
 PLAYLIST_EXT = (".m3u", ".m3u8")
 ALBUM_SELECTION_PAGE_SIZE = 15
+# Parallel workers for the copy phase (I/O-bound on USB flash).
+COPY_WORKERS = 4
 # =======================================================
 
 
@@ -206,6 +210,44 @@ class SyncResult:
 
 
 @dataclass
+class FileEntry:
+    """One file discovered during a scandir walk, path relative to the scan base."""
+    rel_path: str
+    size: int
+    mtime: float
+
+
+@dataclass
+class DeviceScan:
+    """Single-pass snapshot of a destination drive (built once, reused everywhere)."""
+    root: str
+    artist_files: dict[str, list[str]] = field(default_factory=dict)   # artist folder -> [rel_path]
+    files: dict[str, tuple[int, float]] = field(default_factory=dict)  # rel_path -> (size, mtime)
+    playlists: set[str] = field(default_factory=set)
+
+    @property
+    def artist_folders(self) -> list[str]:
+        return sorted(self.artist_files)
+
+    @property
+    def total_size(self) -> int:
+        return sum(size for size, _ in self.files.values())
+
+    @property
+    def audio_paths(self) -> set[str]:
+        return {rel for rel in self.files if Path(rel).suffix.lower() in AUDIO_EXT}
+
+
+@dataclass
+class CopyJob:
+    src: str
+    dst: str
+    dest_drive: str
+    transfer_bytes: int   # full source size (throughput accounting)
+    extra_bytes: int      # additional free space the copy consumes on the device
+
+
+@dataclass
 class LibraryPlan:
     assignments: dict[str, str]
     file_locations: dict[str, str]
@@ -218,6 +260,7 @@ class LibraryPlan:
     folder_sizes: dict[str, int]
     folder_playlists: dict[str, set[str]]
     excluded_folders: set[str]
+    source_files: dict[str, list[FileEntry]] = field(default_factory=dict)
 
 
 @dataclass
@@ -254,8 +297,10 @@ class ScanReport:
     stale_playlists: list[str]
     albums_to_add: int = 0
     albums_to_remove: int = 0
-    album_diff: AlbumDiff | None = None          # ← NEW
+    album_diff: AlbumDiff | None = None
     space_projection: dict[str, DriveSpaceProjection] = field(default_factory=dict)
+    device_scans: dict[str, DeviceScan] = field(default_factory=dict)
+    source_total_bytes: int = 0
 
 
 PUNCT_TRANSLATION = str.maketrans({
@@ -296,6 +341,7 @@ _COLOURS_OK = _enable_vt_processing()
 _ANSI_GREEN = "\033[32m"
 _ANSI_RED = "\033[31m"
 _ANSI_YELLOW = "\033[33m"
+_ANSI_CYAN = "\033[36m"
 _ANSI_BOLD = "\033[1m"
 _ANSI_DIM = "\033[2m"
 _ANSI_RESET = "\033[0m"
@@ -319,6 +365,10 @@ def _bold(text: str) -> str:
 
 def _dim(text: str) -> str:
     return f"{_ANSI_DIM}{text}{_ANSI_RESET}" if _COLOURS_OK else text
+
+
+def _cyan(text: str) -> str:
+    return f"{_ANSI_CYAN}{text}{_ANSI_RESET}" if _COLOURS_OK else text
 
 
 @dataclass
@@ -433,11 +483,72 @@ class AlbumDiff:
         return sum(m[1] for m in self.moves)
 
 
+def _scan_tree(root: str, base: str) -> list[FileEntry]:
+    """Walk *root* with os.scandir (stat is cached on Windows) → entries relative to *base*.
+
+    A single os.scandir pass yields size/mtime without an extra stat() syscall per file,
+    which is the whole point: it replaces the per-file Path.stat() storm that made every
+    scan crawl over USB flash.
+    """
+    entries: list[FileEntry] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            stat_result = entry.stat()
+                            rel = os.path.normpath(os.path.relpath(entry.path, base))
+                            entries.append(FileEntry(rel, stat_result.st_size, stat_result.st_mtime))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return entries
+
+
+def scan_source_folders(source_dir: str, folders: list[str] | set[str]) -> dict[str, list[FileEntry]]:
+    """One scandir pass per source artist folder, reused for sizing, planning and copy jobs."""
+    return {
+        folder: _scan_tree(os.path.join(source_dir, folder), source_dir)
+        for folder in folders
+    }
+
+
+def scan_device(drive_root: str) -> DeviceScan:
+    """One scandir pass over a destination drive: artist files (+size/mtime) and playlists."""
+    scan = DeviceScan(root=drive_root)
+    if not os.path.isdir(drive_root):
+        return scan
+    try:
+        with os.scandir(drive_root) as iterator:
+            top_entries = list(iterator)
+    except OSError:
+        return scan
+
+    for entry in top_entries:
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                folder_entries = _scan_tree(entry.path, drive_root)
+                scan.artist_files[entry.name] = [fe.rel_path for fe in folder_entries]
+                for fe in folder_entries:
+                    scan.files[fe.rel_path] = (fe.size, fe.mtime)
+            elif entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(PLAYLIST_EXT):
+                scan.playlists.add(entry.name)
+        except OSError:
+            continue
+    return scan
+
+
 def get_dir_size(path: str | Path) -> int:
-    root = Path(path)
-    if not root.exists():
+    root = str(path)
+    if not os.path.isdir(root):
         return 0
-    return sum(file.stat().st_size for file in root.glob("**/*") if file.is_file())
+    return sum(entry.size for entry in _scan_tree(root, root))
 
 
 def human_size(size_bytes: int) -> str:
@@ -918,9 +1029,15 @@ def choose_drive_for_group(
     internal_used: int,
     sd_used: int,
     config: AppConfig,
+    preferred_drive: str | None = None,
 ) -> str | None:
     fits_internal = internal_used + group.size_bytes <= config.internal_music_budget_bytes
     fits_sd = sd_used + group.size_bytes <= config.sd_max_bytes
+
+    if preferred_drive == config.internal_drive and fits_internal:
+        return config.internal_drive
+    if preferred_drive == config.sd_drive and fits_sd:
+        return config.sd_drive
 
     if fits_internal and fits_sd:
         internal_free_after = config.internal_music_budget_bytes - (internal_used + group.size_bytes)
@@ -933,7 +1050,40 @@ def choose_drive_for_group(
     return None
 
 
-def build_library_plan(config: AppConfig, result: SyncResult) -> LibraryPlan | None:
+def preferred_drive_for_group(
+    group: FolderGroup,
+    device_scans: dict[str, DeviceScan] | None,
+    config: AppConfig,
+) -> str | None:
+    if not device_scans:
+        return None
+
+    scores: dict[str, tuple[int, int]] = {}
+    for drive in (config.internal_drive, config.sd_drive):
+        scan = device_scans.get(drive)
+        if scan is None:
+            continue
+        folder_count = 0
+        byte_count = 0
+        for folder in group.folders:
+            rel_files = scan.artist_files.get(folder)
+            if not rel_files:
+                continue
+            folder_count += 1
+            byte_count += sum(scan.files[rel][0] for rel in rel_files if rel in scan.files)
+        if folder_count:
+            scores[drive] = (folder_count, byte_count)
+
+    if not scores:
+        return None
+    return max(scores, key=lambda drive: scores[drive])
+
+
+def build_library_plan(
+    config: AppConfig,
+    result: SyncResult,
+    device_scans: dict[str, DeviceScan] | None = None,
+) -> LibraryPlan | None:
     source_path = Path(config.source_dir)
     playlist_path = Path(config.playlist_dir)
 
@@ -950,9 +1100,10 @@ def build_library_plan(config: AppConfig, result: SyncResult) -> LibraryPlan | N
     if excluded_folders:
         result.artists_excluded = len(excluded_folders)
         source_artists -= excluded_folders
+    source_files = scan_source_folders(config.source_dir, source_artists)
     folder_sizes = {
-        folder: get_dir_size(os.path.join(config.source_dir, folder))
-        for folder in source_artists
+        folder: sum(entry.size for entry in entries)
+        for folder, entries in source_files.items()
     }
 
     playlist_names = set(list_playlist_files(config.playlist_dir))
@@ -992,7 +1143,8 @@ def build_library_plan(config: AppConfig, result: SyncResult) -> LibraryPlan | N
     sd_used = 0
 
     for group in groups:
-        dest_drive = choose_drive_for_group(group, internal_used, sd_used, config)
+        preferred_drive = preferred_drive_for_group(group, device_scans, config)
+        dest_drive = choose_drive_for_group(group, internal_used, sd_used, config, preferred_drive)
         if dest_drive is None:
             result.artists_skipped += len(group.folders)
             result.log(
@@ -1015,14 +1167,11 @@ def build_library_plan(config: AppConfig, result: SyncResult) -> LibraryPlan | N
                 result.artists_sd += 1
             result.log(f"{folder} -> {dest_drive} ({human_size(folder_sizes[folder])})")
 
-            folder_root = os.path.join(config.source_dir, folder)
-            for root, _, files in os.walk(folder_root):
-                for file_name in files:
-                    full_source = os.path.join(root, file_name)
-                    rel_path = os.path.normpath(os.path.relpath(full_source, config.source_dir))
-                    desired_files_by_drive[dest_drive].add(rel_path)
-                    if file_name.lower().endswith(AUDIO_EXT):
-                        file_locations[rel_path] = dest_drive
+            for entry in source_files.get(folder, []):
+                rel_path = entry.rel_path
+                desired_files_by_drive[dest_drive].add(rel_path)
+                if rel_path.lower().endswith(AUDIO_EXT):
+                    file_locations[rel_path] = dest_drive
 
         for playlist_name in group.playlist_names:
             track_lines = [
@@ -1048,48 +1197,110 @@ def build_library_plan(config: AppConfig, result: SyncResult) -> LibraryPlan | N
         folder_sizes=folder_sizes,
         folder_playlists=folder_playlists,
         excluded_folders=excluded_folders,
+        source_files=source_files,
     )
 
 
-def should_copy_file(src: str, dst: str) -> bool:
-    return not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst)
+def build_copy_jobs(
+    config: AppConfig,
+    plan: LibraryPlan,
+    device_scans: dict[str, DeviceScan],
+) -> list[CopyJob]:
+    """Decide what to copy using cached source + device metadata — no per-file stat()."""
+    jobs: list[CopyJob] = []
+    for artist_folder, dest_drive in plan.assignments.items():
+        device = device_scans.get(dest_drive)
+        existing = device.files if device else {}
+        for entry in plan.source_files.get(artist_folder, []):
+            rel = entry.rel_path
+            current = existing.get(rel)
+            if current is None:
+                extra_bytes = entry.size
+            else:
+                dst_size, dst_mtime = current
+                if entry.mtime <= dst_mtime:
+                    continue
+                extra_bytes = max(entry.size - dst_size, 0)
+            jobs.append(
+                CopyJob(
+                    src=os.path.join(config.source_dir, rel),
+                    dst=os.path.join(dest_drive, rel),
+                    dest_drive=dest_drive,
+                    transfer_bytes=entry.size,
+                    extra_bytes=extra_bytes,
+                )
+            )
+    return jobs
 
 
-def estimate_additional_copy_bytes(src: str, dst: str) -> int:
-    src_size = os.path.getsize(src)
-    if not os.path.exists(dst):
-        return src_size
-    try:
-        dst_size = os.path.getsize(dst)
-    except OSError:
-        dst_size = 0
-    return max(src_size - dst_size, 0)
-
-
-def calculate_pending_copy_budgets(config: AppConfig, plan: LibraryPlan) -> dict[str, PendingCopyBudget]:
+def budgets_from_jobs(config: AppConfig, jobs: list[CopyJob]) -> dict[str, PendingCopyBudget]:
     budgets = {
         config.internal_drive: PendingCopyBudget(),
         config.sd_drive: PendingCopyBudget(),
     }
-
-    for artist_folder, dest_drive in plan.assignments.items():
-        artist_path = os.path.join(config.source_dir, artist_folder)
-        dest_path = os.path.join(dest_drive, artist_folder)
-        budget = budgets.setdefault(dest_drive, PendingCopyBudget())
-
-        for root, _, files in os.walk(artist_path):
-            rel_root = os.path.relpath(root, artist_path)
-            dest_dir = dest_path if rel_root == "." else os.path.join(dest_path, rel_root)
-
-            for file_name in files:
-                src_file = os.path.join(root, file_name)
-                dst_file = os.path.join(dest_dir, file_name)
-                if should_copy_file(src_file, dst_file):
-                    budget.files += 1
-                    budget.bytes_needed += estimate_additional_copy_bytes(src_file, dst_file)
-                    budget.transfer_bytes += os.path.getsize(src_file)
-
+    for job in jobs:
+        budget = budgets.setdefault(job.dest_drive, PendingCopyBudget())
+        budget.files += 1
+        budget.bytes_needed += job.extra_bytes
+        budget.transfer_bytes += job.transfer_bytes
     return budgets
+
+
+def calculate_pending_copy_budgets(
+    config: AppConfig,
+    plan: LibraryPlan,
+    device_scans: dict[str, DeviceScan],
+) -> dict[str, PendingCopyBudget]:
+    return budgets_from_jobs(config, build_copy_jobs(config, plan, device_scans))
+
+
+def _execute_copies(
+    jobs: list[CopyJob],
+    result: SyncResult,
+    dry_run: bool,
+    progress: ProgressTracker | None,
+) -> None:
+    """Copy planned files, in parallel when writing for real (I/O-bound on USB)."""
+    if not jobs:
+        return
+
+    def record(job: CopyJob) -> None:
+        result.files_copied += 1
+        result.log(f"Copying: {os.path.basename(job.src)}")
+        if progress:
+            progress.step(f"Syncing {os.path.basename(job.src)}", bytes_processed=job.transfer_bytes or None)
+
+    if dry_run:
+        for job in jobs:
+            record(job)
+        return
+
+    lock = threading.Lock()
+    errors: list[tuple[CopyJob, OSError]] = []
+
+    def worker(job: CopyJob) -> None:
+        try:
+            os.makedirs(os.path.dirname(job.dst), exist_ok=True)
+            shutil.copy2(job.src, job.dst)
+        except OSError as exc:
+            with lock:
+                errors.append((job, exc))
+            return
+        with lock:
+            record(job)
+
+    with ThreadPoolExecutor(max_workers=COPY_WORKERS) as executor:
+        list(executor.map(worker, jobs))
+
+    if errors:
+        job, exc = errors[0]
+        if getattr(exc, "winerror", None) == 112:
+            raise OSError(
+                f"Not enough free space while copying {os.path.basename(job.src)} to {job.dst}. "
+                "Stale files are cleaned first, but this device still ran out of space "
+                "during the copy phase."
+            ) from exc
+        raise exc
 
 
 def ensure_copy_space_available(
@@ -1097,10 +1308,11 @@ def ensure_copy_space_available(
     plan: LibraryPlan,
     result: SyncResult,
     copy_budgets: dict[str, PendingCopyBudget] | None = None,
+    device_scans: dict[str, DeviceScan] | None = None,
 ) -> None:
     shortages: list[str] = []
     if copy_budgets is None:
-        copy_budgets = calculate_pending_copy_budgets(config, plan)
+        copy_budgets = calculate_pending_copy_budgets(config, plan, device_scans or {})
 
     for drive, budget in copy_budgets.items():
         if budget.files == 0:
@@ -1126,10 +1338,17 @@ def build_space_projection(
     plan: LibraryPlan,
     stale_music_files: list[str],
     stale_playlists: list[str],
+    device_scans: dict[str, DeviceScan],
 ) -> dict[str, DriveSpaceProjection]:
     projections: dict[str, DriveSpaceProjection] = {}
-    budgets = calculate_pending_copy_budgets(config, plan)
+    budgets = calculate_pending_copy_budgets(config, plan, device_scans)
     stale_paths = stale_music_files + stale_playlists
+
+    # Resolve reclaimable sizes from the cached device scan instead of stat()ing each stale file.
+    size_lookup: dict[str, int] = {}
+    for drive, scan in device_scans.items():
+        for rel, (size, _) in scan.files.items():
+            size_lookup[os.path.normcase(os.path.join(drive, rel))] = size
 
     for drive in (config.internal_drive, config.sd_drive):
         budget = budgets.get(drive, PendingCopyBudget())
@@ -1141,6 +1360,10 @@ def build_space_projection(
         reclaimable_bytes = 0
         for stale_path in stale_paths:
             if not is_path_within_root(stale_path, drive):
+                continue
+            cached = size_lookup.get(os.path.normcase(stale_path))
+            if cached is not None:
+                reclaimable_bytes += cached
                 continue
             try:
                 reclaimable_bytes += os.path.getsize(stale_path)
@@ -1159,48 +1382,6 @@ def build_space_projection(
         projections[drive] = projection
 
     return projections
-
-
-def copy_if_newer(src: str, dst: str, result: SyncResult, dry_run: bool) -> int:
-    if should_copy_file(src, dst):
-        transfer_bytes = os.path.getsize(src)
-        result.files_copied += 1
-        result.log(f"Copying: {os.path.basename(src)}")
-        if not dry_run:
-            try:
-                shutil.copy2(src, dst)
-            except OSError as exc:
-                if getattr(exc, "winerror", None) == 112:
-                    raise OSError(
-                        f"Not enough free space while copying {os.path.basename(src)} to {dst}. "
-                        "The sync now cleans stale files first, but this device still ran out "
-                        "of space during the copy phase."
-                    ) from exc
-                raise
-        return transfer_bytes
-    return 0
-
-
-def sync_artist_folder(
-    source_root: str,
-    dest_root: str,
-    result: SyncResult,
-    dry_run: bool,
-    progress: ProgressTracker | None = None,
-) -> None:
-    for root, _, files in os.walk(source_root):
-        rel_root = os.path.relpath(root, source_root)
-        dest_dir = dest_root if rel_root == "." else os.path.join(dest_root, rel_root)
-
-        if not dry_run:
-            os.makedirs(dest_dir, exist_ok=True)
-
-        for file_name in files:
-            src_file = os.path.join(root, file_name)
-            dst_file = os.path.join(dest_dir, file_name)
-            copied_bytes = copy_if_newer(src_file, dst_file, result, dry_run)
-            if progress:
-                progress.step(f"Syncing {file_name}", bytes_processed=copied_bytes or None)
 
 
 def get_drive_music_files(drive_root: str) -> dict[str, list[str]]:
@@ -1248,19 +1429,40 @@ def count_albums_to_add(config: AppConfig, plan: LibraryPlan) -> int:
     )
 
 
-def count_albums_to_remove(config: AppConfig, plan: LibraryPlan) -> int:
+def count_albums_to_remove(
+    config: AppConfig,
+    plan: LibraryPlan,
+    device_scans: dict[str, DeviceScan],
+) -> int:
     """Count artist folders present on either drive that the plan will delete."""
     stale: set[str] = set()
     for drive in (config.internal_drive, config.sd_drive):
-        for folder in list_artist_folders(drive):
+        scan = device_scans.get(drive)
+        if scan is None:
+            continue
+        for folder in scan.artist_folders:
             if folder not in plan.source_artists or plan.assignments.get(folder) != drive:
                 stale.add(f"{drive}:{folder}")
     return len(stale)
 
 
-def build_scan_report(config: AppConfig) -> ScanReport:
+def build_scan_report(config: AppConfig, status: Callable[[str], None] | None = None) -> ScanReport:
+    def note(message: str) -> None:
+        if status:
+            status(message)
+
     result = SyncResult()
-    plan = build_library_plan(config, result)
+    note("Scanning internal storage...")
+    internal_scan = scan_device(config.internal_drive)
+    note("Scanning SD card...")
+    sd_scan = scan_device(config.sd_drive)
+    device_scans = {
+        config.internal_drive: internal_scan,
+        config.sd_drive: sd_scan,
+    }
+
+    note("Scanning source library...")
+    plan = build_library_plan(config, result, device_scans=device_scans)
     if plan is None:
         return ScanReport(
             plan=None,
@@ -1268,19 +1470,20 @@ def build_scan_report(config: AppConfig) -> ScanReport:
             duplicate_tracks=[],
             stale_music_files=[],
             stale_playlists=[],
+            device_scans=device_scans,
         )
 
+    note("Computing changes...")
     duplicate_tracks = sorted(
-        get_drive_audio_paths(config.internal_drive)
-        & get_drive_audio_paths(config.sd_drive),
+        internal_scan.audio_paths & sd_scan.audio_paths,
         key=str.lower,
     )
-    stale_music_files = iter_stale_music_files(config, plan)
-    stale_playlists = iter_stale_playlists(config, plan)
+    stale_music_files = iter_stale_music_files(config, plan, device_scans)
+    stale_playlists = iter_stale_playlists(config, plan, device_scans)
     albums_to_add = count_albums_to_add(config, plan)
-    albums_to_remove = count_albums_to_remove(config, plan)
-    album_diff = compute_album_diff(config, plan)          # ← NEW
-    space_projection = build_space_projection(config, plan, stale_music_files, stale_playlists)
+    albums_to_remove = count_albums_to_remove(config, plan, device_scans)
+    album_diff = compute_album_diff(config, plan, device_scans)
+    space_projection = build_space_projection(config, plan, stale_music_files, stale_playlists, device_scans)
 
     return ScanReport(
         plan=plan,
@@ -1290,8 +1493,10 @@ def build_scan_report(config: AppConfig) -> ScanReport:
         stale_playlists=stale_playlists,
         albums_to_add=albums_to_add,
         albums_to_remove=albums_to_remove,
-        album_diff=album_diff,                             # ← NEW
+        album_diff=album_diff,
         space_projection=space_projection,
+        device_scans=device_scans,
+        source_total_bytes=sum(plan.folder_sizes.values()),
     )
 
 
@@ -1333,32 +1538,30 @@ def process_playlist(
         progress.step(f"Processing playlist {playlist_name}")
 
 
-def count_sync_steps(config: AppConfig, plan: LibraryPlan) -> int:
-    file_steps = 0
-    for artist_folder in plan.assignments:
-        artist_path = os.path.join(config.source_dir, artist_folder)
-        for _, _, files in os.walk(artist_path):
-            file_steps += len(files)
-    return file_steps + len(plan.playlist_names)
-
-
 def sync_library(
     config: AppConfig,
     dry_run: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> SyncResult:
     result = SyncResult()
-    plan = build_library_plan(config, result)
+    # One scan of each device up front, reused for stale detection and copy planning.
+    device_scans = {
+        config.internal_drive: scan_device(config.internal_drive),
+        config.sd_drive: scan_device(config.sd_drive),
+    }
+    plan = build_library_plan(config, result, device_scans=device_scans)
     if plan is None:
         return result
-    copy_budgets = calculate_pending_copy_budgets(config, plan)
-    total_copy_bytes = sum(budget.transfer_bytes for budget in copy_budgets.values())
+
+    copy_jobs = build_copy_jobs(config, plan, device_scans)
+    copy_budgets = budgets_from_jobs(config, copy_jobs)
+    total_copy_bytes = sum(job.transfer_bytes for job in copy_jobs)
 
     result.log("Scanning library...")
-    stale_music_files = iter_stale_music_files(config, plan)
-    stale_playlists = iter_stale_playlists(config, plan)
+    stale_music_files = iter_stale_music_files(config, plan, device_scans)
+    stale_playlists = iter_stale_playlists(config, plan, device_scans)
     progress = ProgressTracker(
-        count_sync_steps(config, plan) + len(stale_music_files) + len(stale_playlists),
+        len(copy_jobs) + len(plan.playlist_names) + len(stale_music_files) + len(stale_playlists),
         progress_callback,
     )
 
@@ -1381,10 +1584,7 @@ def sync_library(
 
     result.log("Copying music...")
     progress.begin_copy_phase(total_copy_bytes)
-    for artist_folder, dest_drive in plan.assignments.items():
-        artist_path = os.path.join(config.source_dir, artist_folder)
-        dest_path = os.path.join(dest_drive, artist_folder)
-        sync_artist_folder(artist_path, dest_path, result, dry_run, progress)
+    _execute_copies(copy_jobs, result, dry_run, progress)
     progress.end_copy_phase()
 
     result.log("Processing playlists...")
@@ -1436,34 +1636,45 @@ def prune_empty_root_artist_dirs(drive_root: str, plan: LibraryPlan) -> None:
             pass
 
 
-def iter_stale_music_files(config: AppConfig, plan: LibraryPlan) -> list[str]:
+def iter_stale_music_files(
+    config: AppConfig,
+    plan: LibraryPlan,
+    device_scans: dict[str, DeviceScan],
+) -> list[str]:
     stale_files: list[str] = []
     for drive in (config.internal_drive, config.sd_drive):
-        files_by_artist = get_drive_music_files(drive)
+        scan = device_scans.get(drive)
+        if scan is None:
+            continue
         desired_files = plan.desired_files_by_drive[drive]
 
-        for artist_folder, rel_files in files_by_artist.items():
+        for artist_folder, rel_files in scan.artist_files.items():
             assigned_drive = plan.assignments.get(artist_folder)
             for rel_path in rel_files:
-                rel_obj = Path(rel_path)
                 if assigned_drive is None and artist_folder in plan.source_artists:
                     continue
                 if assigned_drive != drive:
                     stale_files.append(os.path.join(drive, rel_path))
                     continue
-                if os.path.normpath(str(rel_obj)) not in desired_files:
+                if rel_path not in desired_files:
                     stale_files.append(os.path.join(drive, rel_path))
     return stale_files
 
 
-def iter_stale_playlists(config: AppConfig, plan: LibraryPlan) -> list[str]:
+def iter_stale_playlists(
+    config: AppConfig,
+    plan: LibraryPlan,
+    device_scans: dict[str, DeviceScan],
+) -> list[str]:
     stale_playlists: list[str] = []
     for drive in (config.internal_drive, config.sd_drive):
+        scan = device_scans.get(drive)
+        if scan is None:
+            continue
         expected = plan.expected_playlists_by_drive[drive]
-        for playlist_name in get_drive_playlists(drive):
-            playlist_path = os.path.join(drive, playlist_name)
+        for playlist_name in scan.playlists:
             if playlist_name not in expected:
-                stale_playlists.append(playlist_path)
+                stale_playlists.append(os.path.join(drive, playlist_name))
     return stale_playlists
 
 
@@ -1473,12 +1684,16 @@ def cleanup_library(
     progress_callback: ProgressCallback | None = None,
 ) -> SyncResult:
     result = SyncResult()
-    plan = build_library_plan(config, result)
+    device_scans = {
+        config.internal_drive: scan_device(config.internal_drive),
+        config.sd_drive: scan_device(config.sd_drive),
+    }
+    plan = build_library_plan(config, result, device_scans=device_scans)
     if plan is None:
         return result
 
-    stale_music_files = iter_stale_music_files(config, plan)
-    stale_playlists = iter_stale_playlists(config, plan)
+    stale_music_files = iter_stale_music_files(config, plan, device_scans)
+    stale_playlists = iter_stale_playlists(config, plan, device_scans)
     progress = ProgressTracker(
         max(len(stale_music_files) + len(stale_playlists), 1),
         progress_callback,
@@ -1981,7 +2196,11 @@ def sample_folder_files(source_dir: str, folder_name: str, limit: int = 10) -> l
     return samples
 
 
-def compute_album_diff(config: AppConfig, plan: LibraryPlan) -> AlbumDiff:
+def compute_album_diff(
+    config: AppConfig,
+    plan: LibraryPlan,
+    device_scans: dict[str, DeviceScan],
+) -> AlbumDiff:
     """
     Classify every album folder as an addition, deletion, move, or unchanged.
 
@@ -1995,7 +2214,10 @@ def compute_album_diff(config: AppConfig, plan: LibraryPlan) -> AlbumDiff:
     # Current state: folder name → set of drives it exists on
     current_drives: dict[str, set[str]] = {}
     for drive in (config.internal_drive, config.sd_drive):
-        for folder in list_artist_folders(drive):
+        scan = device_scans.get(drive)
+        if scan is None:
+            continue
+        for folder in scan.artist_folders:
             current_drives.setdefault(folder, set()).add(drive)
 
     planned = plan.assignments  # folder → destination drive
@@ -2009,13 +2231,15 @@ def compute_album_diff(config: AppConfig, plan: LibraryPlan) -> AlbumDiff:
         current = current_drives.get(folder, set())
         planned_drive = planned.get(folder)
 
-        # Resolve size – prefer the plan's pre-computed value, then device.
+        # Resolve size – prefer the plan's pre-computed value, then the cached device scan.
         size = plan.folder_sizes.get(folder, 0)
         if size == 0 and current:
             for d in sorted(current):
-                candidate = os.path.join(d, folder)
-                if os.path.isdir(candidate):
-                    size = get_dir_size(candidate)
+                scan = device_scans.get(d)
+                if scan is None:
+                    continue
+                size = sum(scan.files[rel][0] for rel in scan.artist_files.get(folder, []) if rel in scan.files)
+                if size:
                     break
 
         if planned_drive and not current:
@@ -2056,7 +2280,7 @@ def view_album_changes(config: AppConfig, report: ScanReport) -> None:
 
     diff = report.album_diff
     if diff is None:
-        diff = compute_album_diff(config, report.plan)
+        diff = compute_album_diff(config, report.plan, report.device_scans)
 
     net_cnt = diff.net_count
     net_sz = diff.net_size
@@ -2164,23 +2388,32 @@ def view_scrobble_plan(config: AppConfig) -> None:
     pause()
 
 
+def _drive_used_size(report: ScanReport, drive: str) -> int:
+    scan = report.device_scans.get(drive)
+    return scan.total_size if scan is not None else get_dir_size(drive)
+
+
 def render_dashboard(config: AppConfig, report: ScanReport) -> None:
-    source_size = human_size(get_dir_size(config.source_dir))
-    internal_size = human_size(get_dir_size(config.internal_drive))
-    sd_size = human_size(get_dir_size(config.sd_drive))
+    source_bytes = report.source_total_bytes or get_dir_size(config.source_dir)
+    source_size = human_size(source_bytes)
+    internal_size = human_size(_drive_used_size(report, config.internal_drive))
+    sd_size = human_size(_drive_used_size(report, config.sd_drive))
     excluded_summary = format_album_exclusion_summary(config.excluded_album_entries)
-    scrobble_log_count = count_scrobble_logs(config)
-    pending_scrobbles = count_pending_scrobbles(config)
+
+    # Parse scrobble logs once, derive all three counts from the same pass.
+    scrobble_files = list_scrobble_files(config)
+    scrobble_log_count = len(scrobble_files)
+    pending_scrobbles = sum(
+        1 for sf in scrobble_files for e in sf.entries if e.source_flag.upper() == "L"
+    )
     skipped_scrobbles = sum(
-        1
-        for sf in list_scrobble_files(config)
-        for e in sf.entries
-        if e.source_flag.upper() != "L"
+        1 for sf in scrobble_files for e in sf.entries if e.source_flag.upper() != "L"
     )
 
-    print("=" * 72)
-    print(" Sony Sync Dashboard")
-    print("=" * 72)
+    bar = _cyan("=" * 72)
+    print(bar)
+    print(_bold(_cyan(" Sony Sync Dashboard")))
+    print(bar)
     print(f" Source library : {config.source_dir}")
     print(f" Playlist source: {config.playlist_dir}")
     print(f" Internal music : {config.internal_drive} ({internal_size} used / {config.internal_max_gb:.1f} GB)")
@@ -2191,22 +2424,28 @@ def render_dashboard(config: AppConfig, report: ScanReport) -> None:
         f" Internal budget: {human_size(config.internal_music_budget_bytes)}"
         f" after {config.internal_safety_buffer_gb:.1f} GB buffer"
     )
-    print(f" Last.fm        : {config.lastfm_username or '(not signed in)'} | {pending_scrobbles} pending play(s) ({skipped_scrobbles} skipped)")
+    pending_text = (
+        _yellow(f"{pending_scrobbles} pending play(s)") if pending_scrobbles else "0 pending play(s)"
+    )
+    print(
+        f" Last.fm        : {config.lastfm_username or '(not signed in)'} | "
+        f"{pending_text} ({skipped_scrobbles} skipped)"
+    )
     print(f" Scrobble logs  : {scrobble_log_count} file(s)")
-    print("-" * 72)
+    print(_cyan("-" * 72))
 
     if report.plan is None:
-        print(" Scan status    : configuration error")
+        print(_red(" Scan status    : configuration error"))
         for line in report.result.logs[-3:]:
             print(f"  {line}")
-        print("-" * 72)
+        print(_cyan("-" * 72))
         return
 
     playlists_internal = sum(1 for drive in report.plan.playlist_drive.values() if drive == config.internal_drive)
     playlists_sd = sum(1 for drive in report.plan.playlist_drive.values() if drive == config.sd_drive)
     playlists_unplaced = len(report.plan.playlist_names) - len(report.plan.playlist_drive)
 
-    # ── Net album change line ─────────────────────────────────────
+    # ── Net album change line (single source of truth for add/remove) ──
     if report.album_diff is not None:
         d = report.album_diff
         nc = d.net_count
@@ -2214,18 +2453,16 @@ def render_dashboard(config: AppConfig, report: ScanReport) -> None:
         cnt_str = f"+{nc}" if nc >= 0 else str(nc)
         sz_str = f"+{human_size(abs(ns))}" if ns >= 0 else f"-{human_size(abs(ns))}"
         move_note = f", {len(d.moves)} moved" if d.moves else ""
-        print(f" Net album change: {cnt_str} album(s), {sz_str}{move_note}")
-    else:
-        print(f" Albums to add   : {report.albums_to_add}")
-        print(f" Albums to remove: {report.albums_to_remove}")
+        net_line = f" Net album change: {cnt_str} album(s), {sz_str}{move_note}"
+        print(_green(net_line) if (nc or ns) else _dim(net_line))
 
-    print(" Scan snapshot")
+    print(_bold(" Scan snapshot"))
     print(f"  Albums to internal : {report.result.artists_internal}")
     print(f"  Albums to SD card  : {report.result.artists_sd}")
     print(f"  Albums excluded    : {report.result.artists_excluded}")
     print(f"  Albums skipped     : {report.result.artists_skipped}")
-    print(f"  Albums to add      : {report.albums_to_add}")
-    print(f"  Albums to remove   : {report.albums_to_remove}")
+    print(f"  Albums to add      : {_green(str(report.albums_to_add)) if report.albums_to_add else '0'}")
+    print(f"  Albums to remove   : {_red(str(report.albums_to_remove)) if report.albums_to_remove else '0'}")
     print(f"  Playlists internal : {playlists_internal}")
     print(f"  Playlists SD card  : {playlists_sd}")
     print(f"  Playlists unplaced : {playlists_unplaced}")
@@ -2235,15 +2472,16 @@ def render_dashboard(config: AppConfig, report: ScanReport) -> None:
     print(f"  Playlist path misses: {report.result.skipped_entries}")
     if report.space_projection:
         render_space_projection(config, report.space_projection)
-    print("-" * 72)
-    print(" 1. Refresh scan           9. Preview cleanup")
-    print(" 2. View album plan       10. Run cleanup")
-    print(" 3. View playlist plan    11. Preview scrobbles")
-    print(" 4. View album changes    12. Upload scrobbles")      # ← NEW
-    print(" 5. View duplicate inbox  13. Edit sync settings")
-    print(" 6. View removals         14. Edit Last.fm settings")
-    print(" 7. Preview sync summary  15. Quit")                  # ← was 14
-    print(" 8. Run sync")
+    print(_cyan("-" * 72))
+    print(_bold(" Library") + "                  " + _bold("Maintenance"))
+    print(f" {_cyan('1.')} Refresh scan           {_cyan(' 9.')} Preview cleanup")
+    print(f" {_cyan('2.')} View album plan        {_cyan('10.')} Run cleanup")
+    print(f" {_cyan('3.')} View playlist plan     {_cyan('11.')} Preview scrobbles")
+    print(f" {_cyan('4.')} View album changes     {_cyan('12.')} Upload scrobbles")
+    print(f" {_cyan('5.')} View duplicate inbox   {_cyan('13.')} Edit sync settings")
+    print(f" {_cyan('6.')} View removals          {_cyan('14.')} Edit Last.fm settings")
+    print(f" {_cyan('7.')} Preview sync summary   {_cyan('15.')} Quit")
+    print(f" {_cyan('8.')} Run sync")
 
 
 def render_result(title: str, result: SyncResult) -> None:
@@ -2290,42 +2528,49 @@ def render_space_projection(config: AppConfig, projection: dict[str, DriveSpaceP
             f"free after cleanup {human_size(available)}"
         )
         if info.reclaimable_bytes:
-            print(f"               reclaiming about {human_size(info.reclaimable_bytes)} from planned removals")
+            print(_green(f"               reclaiming about {human_size(info.reclaimable_bytes)} from planned removals"))
         if info.shortfall_bytes:
-            print(f"               WARNING short by {human_size(info.shortfall_bytes)}")
+            print(_red(f"               WARNING short by {human_size(info.shortfall_bytes)}"))
 
 
 def view_album_plan(config: AppConfig, report: ScanReport) -> None:
     clear_screen()
-    print("Album Plan")
-    print("=" * 10)
+    print(_bold(_cyan("Album Plan")))
+    print(_cyan("=" * 10))
     if report.plan is None:
         print("No scan data available.")
         pause()
         return
 
+    numbered: list[str] = []  # global index (1-based) -> folder
     for drive in (config.internal_drive, config.sd_drive):
         folders = sorted(
             [folder for folder, assigned in report.plan.assignments.items() if assigned == drive],
             key=str.lower,
         )
         total_size = sum(report.plan.folder_sizes[folder] for folder in folders)
-        print(f"\n{drive_label(drive, config)}: {len(folders)} album(s), {human_size(total_size)}")
+        print(f"\n{_bold(drive_label(drive, config))}: {len(folders)} album(s), {human_size(total_size)}")
         for folder in folders[:40]:
+            numbered.append(folder)
             playlist_count = len(report.plan.folder_playlists.get(folder, set()))
-            print(f"  {folder} [{human_size(report.plan.folder_sizes[folder])}] ({playlist_count} playlist(s))")
+            print(f"  {_cyan(f'{len(numbered):>3}.')} {folder} [{human_size(report.plan.folder_sizes[folder])}] ({playlist_count} playlist(s))")
         if len(folders) > 40:
-            print(f"  ... and {len(folders) - 40} more")
+            print(f"       ... and {len(folders) - 40} more (not numbered)")
 
     if report.result.artists_skipped:
         print(f"\nSkipped albums: {report.result.artists_skipped}")
 
-    folder_name = input("\nType an album folder name to drill into it, or press Enter to go back: ").strip()
-    if not folder_name:
+    selection = input("\nEnter an album number to drill in, or press Enter to go back: ").strip()
+    if not selection:
         return
+    if not selection.isdigit() or not (1 <= int(selection) <= len(numbered)):
+        print("Invalid album number.")
+        pause()
+        return
+    folder_name = numbered[int(selection) - 1]
 
     clear_screen()
-    print(folder_name)
+    print(_bold(folder_name))
     print("=" * len(folder_name))
     assigned_drive = report.plan.assignments.get(folder_name)
     if assigned_drive is None:
@@ -2556,9 +2801,17 @@ def edit_lastfm_settings(config: AppConfig) -> None:
         pause()
 
 
+def scan_library_report(config: AppConfig) -> ScanReport:
+    """Build a scan report while showing live phase feedback (scans block the UI)."""
+    clear_screen()
+    safe_print(_bold(_cyan("Scanning library")))
+    safe_print("")
+    return build_scan_report(config, status=lambda message: safe_print(_dim(f"  {message}")))
+
+
 def run_tui() -> None:
     config = AppConfig()
-    report = build_scan_report(config)
+    report = scan_library_report(config)
 
     while True:
         clear_screen()
@@ -2567,7 +2820,7 @@ def run_tui() -> None:
         choice = input("\nSelect an option: ").strip()
 
         if choice == "1":
-            report = build_scan_report(config)
+            report = scan_library_report(config)
             continue
 
         if choice == "2":
@@ -2602,7 +2855,7 @@ def run_tui() -> None:
             render_result("Sync Preview", preview)
             confirm = input("\nRun the real sync now? [y/N]: ").strip().lower()
             if confirm != "y":
-                report = build_scan_report(config)
+                report = scan_library_report(config)
                 continue
 
             result = run_with_progress(
@@ -2610,7 +2863,7 @@ def run_tui() -> None:
                 lambda progress: sync_library(config, dry_run=False, progress_callback=progress),
             )
             render_result("Sync Complete", result)
-            report = build_scan_report(config)
+            report = scan_library_report(config)
             pause()
             continue
 
@@ -2631,7 +2884,7 @@ def run_tui() -> None:
             render_result("Cleanup Preview", preview)
             confirm = input("\nDelete the stale files shown above? [y/N]: ").strip().lower()
             if confirm != "y":
-                report = build_scan_report(config)
+                report = scan_library_report(config)
                 continue
 
             result = run_with_progress(
@@ -2639,7 +2892,7 @@ def run_tui() -> None:
                 lambda progress: cleanup_library(config, dry_run=False, progress_callback=progress),
             )
             render_result("Cleanup Complete", result)
-            report = build_scan_report(config)
+            report = scan_library_report(config)
             pause()
             continue
 
@@ -2663,12 +2916,12 @@ def run_tui() -> None:
 
         if choice == "13":                                      # ← was 12
             edit_sync_settings(config)
-            report = build_scan_report(config)
+            report = scan_library_report(config)
             continue
 
         if choice == "14":                                      # ← was 13
             edit_lastfm_settings(config)
-            report = build_scan_report(config)
+            report = scan_library_report(config)
             continue
 
         if choice == "15":                                      # ← was 14

@@ -30,7 +30,7 @@ from urllib import error, parse, request
 
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
-DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+DEFAULT_GEMINI_MODEL = "gemini-flash-lite-latest"
 
 
 # ---------------------------------------------------------------------------
@@ -229,21 +229,33 @@ def parse_offset(timecode: str) -> int:
     raise ValueError(f"Invalid timecode: {timecode!r}")
 
 
+_COLLAB_SEPARATOR_RE = re.compile(
+    r"\s*(?:,|\bft\.?|\bfeat\.?|\bfeaturing\b|\bwith\b|&|\bvs\.?)\s+",
+    re.IGNORECASE,
+)
+
+
+def split_collaborating_artists(artist_str: str) -> list[str]:
+    """Split a collaborator string into de-duplicated artist names."""
+    artists: list[str] = []
+    seen: set[str] = set()
+    for part in _COLLAB_SEPARATOR_RE.split(artist_str):
+        artist = part.strip(" ,")
+        if not artist:
+            continue
+        key = re.sub(r"\s+", " ", artist).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        artists.append(artist)
+    return artists
+
+
 def extract_featured_artist(artist_str: str) -> tuple[str, str]:
-    """Split 'Artist ft. Featured' into ('Artist', 'Featured').
-    
-    Handles: ft., feat., featuring, with, &, vs. (case-insensitive)
-    Returns (main_artist, featured_artists) tuple.
-    If no featured artist separator found, returns (full_artist, "").
-    """
-    # Common featured artist patterns
-    pattern = r'\s+(ft\.?|feat(?:uring)?|with|\&|vs\.?)\s+'
-    parts = re.split(pattern, artist_str, maxsplit=1, flags=re.IGNORECASE)
-    
-    if len(parts) >= 3:
-        main = parts[0].strip()
-        featured = parts[2].strip()
-        return main, featured
+    """Split 'Artist ft. Featured' into ('Artist', 'Featured')."""
+    artists = split_collaborating_artists(artist_str)
+    if len(artists) > 1:
+        return artists[0], ", ".join(artists[1:])
     return artist_str.strip(), ""
 
 
@@ -400,17 +412,28 @@ def parse_tracklist_with_gemini(
         main_artist, featured = extract_featured_artist(artist)
         entries.append(TrackEntry(offset, artist, title, timestamp, featured_artists=featured))
 
-    # Validate ascending order
+    # Validate non-decreasing order. "w/" mashups/overlays can legitimately
+    # share the same cue as the previous entry.
     for i in range(1, len(entries)):
-        if entries[i].offset_seconds <= entries[i - 1].offset_seconds:
+        if entries[i].offset_seconds < entries[i - 1].offset_seconds:
             raise ValueError(
                 f"Track timestamps must be in ascending order "
                 f"(got {entries[i].offset_seconds}s after {entries[i - 1].offset_seconds}s)."
             )
 
-    # Compute durations from gaps
+    # Compute durations from the next later cue, so same-time overlays get the
+    # same useful duration instead of zero.
     for i, entry in enumerate(entries[:-1]):
-        entry.duration = max(entries[i + 1].offset_seconds - entry.offset_seconds, 0)
+        next_later = next(
+            (
+                later.offset_seconds
+                for later in entries[i + 1 :]
+                if later.offset_seconds > entry.offset_seconds
+            ),
+            None,
+        )
+        if next_later is not None:
+            entry.duration = next_later - entry.offset_seconds
 
     return entries
 
@@ -994,24 +1017,18 @@ def iter_batches(entries: list[TrackEntry], batch_size: int = 50) -> list[list[T
 def format_artist_title_for_scrobble(
     raw_artist: str, raw_title: str, main_artist_only: bool = False
 ) -> tuple[str, str]:
-    """Spotify-shape output so Last.fm links each featured artist separately.
+    """Format a Last.fm scrobble without duplicating featured artists.
 
-    - artist field: comma-joined "Main, Featured" (multi-artist tag)
-    - title field: appended "(feat. Featured)" for MusicBrainz match
+    - artist field: comma-joined "Main, Featured" collaborator list
+    - title field: unchanged, so Last.fm does not display collaborators twice
     With --main-artist-only: drop featured entirely.
     """
-    main, featured = extract_featured_artist(raw_artist)
-    if not featured:
-        return raw_artist, raw_title
+    artists = split_collaborating_artists(raw_artist)
+    if not artists:
+        return raw_artist.strip(), raw_title
     if main_artist_only:
-        return main, raw_title
-    # Don't double-append if title already has (feat./ft.)
-    if re.search(r"\(\s*(ft|feat)\.?", raw_title, re.IGNORECASE):
-        title_out = raw_title
-    else:
-        title_out = f"{raw_title} (feat. {featured})"
-    artist_out = f"{main}, {featured}"
-    return artist_out, title_out
+        return artists[0], raw_title
+    return ", ".join(artists), raw_title
 
 
 def submit_scrobble_batch(

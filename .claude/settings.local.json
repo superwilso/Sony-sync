@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python -c \"import paste_lastfm; r=paste_lastfm.format_artist_title_for_scrobble\\('Cosmo's Midnight ft. KUCKA', 'Chance On You'\\); print\\(r\\)\")",
       "WebFetch(domain:www.last.fm)",
-      "Bash(PYTHONIOENCODING=utf-8 python -)"
+      "Bash(PYTHONIOENCODING=utf-8 python -)",
+      "PowerShell(Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID,VolumeName,@{n='SizeGB';e={[math]::Round\\($_.Size/1GB,1\\)}},@{n='FreeGB';e={[math]::Round\\($_.FreeSpace/1GB,1\\)}},DriveType | Format-Table -AutoSize | Out-String)"
     ]
   }
 }

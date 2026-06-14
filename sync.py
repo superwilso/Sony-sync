@@ -140,7 +140,7 @@ DEFAULT_LASTFM_USERNAME = os.environ.get("LASTFM_USERNAME", "")
 DEFAULT_LASTFM_SESSION_KEY = os.environ.get("LASTFM_SESSION_KEY", "")
 DEFAULT_INTERNAL_MAX_GB = 54
 DEFAULT_INTERNAL_SAFETY_BUFFER_GB = 0
-DEFAULT_SD_MAX_GB = 32
+DEFAULT_SD_MAX_GB = 29
 DEFAULT_EXCLUDED_ALBUMS = os.environ.get("SYNC_EXCLUDED_ALBUMS", "")
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 
@@ -150,6 +150,12 @@ PLAYLIST_EXT = (".m3u", ".m3u8")
 ALBUM_SELECTION_PAGE_SIZE = 15
 # Parallel workers for the copy phase (I/O-bound on USB flash).
 COPY_WORKERS = 4
+# Headroom kept free on each device so the filesystem never fills to 0 bytes; this
+# is the safety margin that guards against overflowing a drive during the copy phase.
+COPY_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
+# exFAT/FAT store modification times at 2-second granularity, so a freshly copied file
+# can read back up to ~2s off its source. Allow that slack before calling a file "newer".
+MTIME_TOLERANCE_SECONDS = 2
 # =======================================================
 
 
@@ -197,6 +203,7 @@ class SyncResult:
     playlists_deleted: int = 0
     scrobbles_uploaded: int = 0
     scrobbles_ignored: int = 0
+    scrobbles_rejected: int = 0
     scrobble_logs_cleared: int = 0
     artists_internal: int = 0
     artists_sd: int = 0
@@ -757,7 +764,7 @@ def iter_scrobble_batches(entries: list[ScrobbleEntry], batch_size: int = 50) ->
 def submit_scrobble_batch(
     entries: list[ScrobbleEntry],
     config: AppConfig,
-) -> tuple[int, int]:
+) -> tuple[int, int, list[tuple[ScrobbleEntry, str]]]:
     params: dict[str, str] = {
         "method": "track.scrobble",
         "api_key": config.lastfm_api_key,
@@ -792,13 +799,27 @@ def submit_scrobble_batch(
 
     accepted = int(scrobbles_node.attrib.get("accepted", "0"))
     ignored = int(scrobbles_node.attrib.get("ignored", "0"))
-    returned = len(scrobbles_node.findall("scrobble"))
-    if returned != len(entries):
+    scrobble_nodes = scrobbles_node.findall("scrobble")
+    if len(scrobble_nodes) != len(entries):
         raise RuntimeError(
-            f"Last.fm returned {returned} results for a batch of {len(entries)} scrobbles."
+            f"Last.fm returned {len(scrobble_nodes)} results for a batch of {len(entries)} scrobbles."
         )
 
-    return accepted, ignored
+    # Per-scrobble ignoredMessage: code "0" == accepted, anything else == rejected by
+    # Last.fm (e.g. timestamp too old, artist/track ignored). Map each rejection back to
+    # its source entry so the caller can retry or keep it instead of silently dropping it.
+    rejected: list[tuple[ScrobbleEntry, str]] = []
+    for entry, node in zip(entries, scrobble_nodes):
+        ignored_message = node.find("ignoredMessage")
+        if ignored_message is None:
+            continue
+        code = ignored_message.attrib.get("code", "0")
+        if code == "0":
+            continue
+        reason = (ignored_message.text or "").strip() or "rejected by Last.fm"
+        rejected.append((entry, f"{reason} (code {code})"))
+
+    return accepted, ignored, rejected
 
 
 def rewrite_scrobble_file(path: Path, header_lines: list[str], remaining_entries: list[ScrobbleEntry]) -> None:
@@ -1106,6 +1127,20 @@ def build_library_plan(
         for folder, entries in source_files.items()
     }
 
+    # Empty source album folders (failed/incomplete downloads) carry no files, so the
+    # copy phase never creates them on the device — yet they would still count as
+    # "albums to add" forever. Drop them so the plan reflects only real content.
+    empty_folders = {folder for folder, entries in source_files.items() if not entries}
+    if empty_folders:
+        result.log(
+            "Ignoring empty source album folder(s): "
+            f"{format_album_exclusion_summary(sorted(empty_folders, key=str.lower), limit=6)}"
+        )
+        source_artists -= empty_folders
+        for folder in empty_folders:
+            source_files.pop(folder, None)
+            folder_sizes.pop(folder, None)
+
     playlist_names = set(list_playlist_files(config.playlist_dir))
     playlist_tracks: dict[str, list[str]] = {}
     playlist_folders: dict[str, set[str]] = {}
@@ -1218,7 +1253,11 @@ def build_copy_jobs(
                 extra_bytes = entry.size
             else:
                 dst_size, dst_mtime = current
-                if entry.mtime <= dst_mtime:
+                # Up-to-date when the size matches and the source is not genuinely newer.
+                # The tolerance absorbs exFAT/FAT's 2-second timestamp granularity, so an
+                # unchanged file is never recopied just because the device rounded its
+                # mtime down when it was first written. A size mismatch always recopies.
+                if entry.size == dst_size and entry.mtime <= dst_mtime + MTIME_TOLERANCE_SECONDS:
                     continue
                 extra_bytes = max(entry.size - dst_size, 0)
             jobs.append(
@@ -1275,12 +1314,16 @@ def _execute_copies(
             record(job)
         return
 
+    # Create every destination directory once up front. Doing it here instead of inside
+    # each worker removes thousands of redundant makedirs() round-trips to the USB device.
+    for directory in sorted({os.path.dirname(job.dst) for job in jobs}):
+        os.makedirs(directory, exist_ok=True)
+
     lock = threading.Lock()
     errors: list[tuple[CopyJob, OSError]] = []
 
     def worker(job: CopyJob) -> None:
         try:
-            os.makedirs(os.path.dirname(job.dst), exist_ok=True)
             shutil.copy2(job.src, job.dst)
         except OSError as exc:
             with lock:
@@ -1319,12 +1362,13 @@ def ensure_copy_space_available(
             continue
 
         free_bytes = get_free_bytes(drive)
-        if budget.bytes_needed > free_bytes:
-            shortfall = budget.bytes_needed - free_bytes
+        required_bytes = budget.bytes_needed + COPY_SPACE_RESERVE_BYTES
+        if required_bytes > free_bytes:
+            shortfall = required_bytes - free_bytes
             shortages.append(
                 f"{drive_label(drive, config)}: need {human_size(budget.bytes_needed)} for "
-                f"{budget.files} pending file(s), but only {human_size(free_bytes)} is free "
-                f"({human_size(shortfall)} short)."
+                f"{budget.files} pending file(s) plus {human_size(COPY_SPACE_RESERVE_BYTES)} reserve, "
+                f"but only {human_size(free_bytes)} is free ({human_size(shortfall)} short)."
             )
 
     if shortages:
@@ -1374,8 +1418,12 @@ def build_space_projection(
         try:
             projection.free_bytes = get_free_bytes(drive)
             projection.available_after_cleanup = projection.free_bytes + reclaimable_bytes
-            if projection.bytes_to_copy > projection.available_after_cleanup:
-                projection.shortfall_bytes = projection.bytes_to_copy - projection.available_after_cleanup
+            # Mirror the hard guard: require the copy plus the safety reserve to fit.
+            required = projection.bytes_to_copy
+            if required > 0:
+                required += COPY_SPACE_RESERVE_BYTES
+            if required > projection.available_after_cleanup:
+                projection.shortfall_bytes = required - projection.available_after_cleanup
         except OSError as exc:
             projection.error = str(exc)
 
@@ -1575,11 +1623,7 @@ def sync_library(
         progress.step(f"Removing {os.path.basename(playlist_path)}")
 
     if not dry_run:
-        for artist_folder in plan.source_artists:
-            prune_empty_dirs(os.path.join(config.internal_drive, artist_folder))
-            prune_empty_dirs(os.path.join(config.sd_drive, artist_folder))
-        prune_empty_root_artist_dirs(config.internal_drive, plan)
-        prune_empty_root_artist_dirs(config.sd_drive, plan)
+        prune_after_removals(config, plan, stale_music_files)
         ensure_copy_space_available(config, plan, result, copy_budgets)
 
     result.log("Copying music...")
@@ -1634,6 +1678,34 @@ def prune_empty_root_artist_dirs(drive_root: str, plan: LibraryPlan) -> None:
                 os.rmdir(artist_root)
         except OSError:
             pass
+
+
+def prune_after_removals(
+    config: AppConfig,
+    plan: LibraryPlan,
+    stale_music_files: list[str],
+) -> None:
+    """Drop directories emptied by stale-file removal.
+
+    Only the artist folders that actually lost a file are walked, instead of every
+    folder in the library on both drives — pruning stays cheap over USB even though
+    most syncs remove nothing. Whole stale artist roots are then cleared per drive.
+    """
+    drives = (config.internal_drive, config.sd_drive)
+    touched: set[str] = set()
+    for stale_path in stale_music_files:
+        normalized = os.path.normcase(stale_path)
+        for drive in drives:
+            if normalized.startswith(os.path.normcase(os.path.join(drive, ""))):
+                parts = Path(os.path.relpath(stale_path, drive)).parts
+                if parts:
+                    touched.add(os.path.join(drive, parts[0]))
+                break
+
+    for artist_root in touched:
+        prune_empty_dirs(artist_root)
+    for drive in drives:
+        prune_empty_root_artist_dirs(drive, plan)
 
 
 def iter_stale_music_files(
@@ -1708,20 +1780,46 @@ def cleanup_library(
         progress.step(f"Cleaning {os.path.basename(playlist_path)}")
 
     if not dry_run:
-        for artist_folder in plan.source_artists:
-            prune_empty_dirs(os.path.join(config.internal_drive, artist_folder))
-            prune_empty_dirs(os.path.join(config.sd_drive, artist_folder))
-        prune_empty_root_artist_dirs(config.internal_drive, plan)
-        prune_empty_root_artist_dirs(config.sd_drive, plan)
+        prune_after_removals(config, plan, stale_music_files)
 
     result.log("Cleanup complete." if not dry_run else "Cleanup preview complete.")
     return result
+
+
+def _submit_with_retries(
+    submit_batch: list[ScrobbleEntry],
+    config: AppConfig,
+    result: SyncResult,
+    retries: int,
+    retry_delay: float,
+) -> tuple[int, list[tuple[ScrobbleEntry, str]]]:
+    """Submit a batch, then re-submit Last.fm-rejected entries up to *retries* times.
+
+    Non-listened entries are filtered out before this is called, so every rejection here
+    is a genuine Last.fm ignoredMessage. Returns the total accepted count and the entries
+    still rejected after the final attempt (for the caller to keep in the log).
+    """
+    accepted_total, _, rejected = submit_scrobble_batch(submit_batch, config)
+
+    attempt = 0
+    while rejected and attempt < retries:
+        attempt += 1
+        if retry_delay > 0:
+            time.sleep(retry_delay)
+        retry_entries = [entry for entry, _ in rejected]
+        result.log(f"Retry {attempt}/{retries}: re-submitting {len(retry_entries)} rejected scrobble(s).")
+        accepted, _, rejected = submit_scrobble_batch(retry_entries, config)
+        accepted_total += accepted
+
+    return accepted_total, rejected
 
 
 def upload_scrobbles(
     config: AppConfig,
     dry_run: bool = True,
     progress_callback: ProgressCallback | None = None,
+    retries: int = 0,
+    retry_delay: float = 2.0,
 ) -> SyncResult:
     result = SyncResult()
     scrobble_files = list_scrobble_files(config, result)
@@ -1773,25 +1871,35 @@ def upload_scrobbles(
 
         processed_count = 0
         stop_processing = False
+        kept_entries: list[ScrobbleEntry] = []
         for batch in iter_scrobble_batches(scrobble_file.entries):
             submit_batch = [e for e in batch if e.source_flag.upper() == "L"]
             skipped_in_batch = len(batch) - len(submit_batch)
 
             try:
                 if submit_batch:
-                    accepted, ignored = submit_scrobble_batch(submit_batch, config)
+                    accepted, rejected = _submit_with_retries(
+                        submit_batch, config, result, retries, retry_delay
+                    )
                 else:
-                    accepted, ignored = 0, 0
+                    accepted, rejected = 0, []
             except (OSError, ET.ParseError, RuntimeError, error.URLError) as exc:
                 result.log(f"Last.fm upload failed for {scrobble_file.path}: {exc}")
                 stop_processing = True
                 break
 
             result.scrobbles_uploaded += accepted
-            result.scrobbles_ignored += ignored + skipped_in_batch
+            result.scrobbles_ignored += skipped_in_batch
+            result.scrobbles_rejected += len(rejected)
             processed_count += len(batch)
+            # Rejected entries survive (in original order) so a later run can try again
+            # instead of losing the play; accepted and non-listened entries are dropped.
+            kept_entries.extend(entry for entry, _ in rejected)
+            for entry, reason in rejected:
+                result.log(f"Rejected: {entry.artist} - {entry.track}: {reason}")
             result.log(
-                f"Uploaded batch from {scrobble_file.path}: accepted {accepted}, ignored {ignored + skipped_in_batch} ({skipped_in_batch} non-listened)."
+                f"Uploaded batch from {scrobble_file.path}: accepted {accepted}, "
+                f"non-listened {skipped_in_batch}, rejected {len(rejected)}."
             )
             for entry in batch:
                 if entry.source_flag.upper() == "L":
@@ -1799,15 +1907,22 @@ def upload_scrobbles(
                 else:
                     progress.step(f"Skipping {entry.track[:28]}")
 
-        remaining_entries = scrobble_file.entries[processed_count:]
+        remaining_entries = kept_entries + scrobble_file.entries[processed_count:]
         if processed_count > 0:
             rewrite_scrobble_file(scrobble_file.path, scrobble_file.header_lines, remaining_entries)
             if not remaining_entries:
                 result.scrobble_logs_cleared += 1
                 result.log(f"Cleared uploaded scrobbles from {scrobble_file.path}")
             else:
+                details: list[str] = []
+                if kept_entries:
+                    details.append(f"{len(kept_entries)} rejected")
+                unprocessed = len(remaining_entries) - len(kept_entries)
+                if unprocessed:
+                    details.append(f"{unprocessed} unprocessed")
+                suffix = f" ({', '.join(details)})" if details else ""
                 result.log(
-                    f"Kept {len(remaining_entries)} unuploaded scrobble(s) in {scrobble_file.path}"
+                    f"Kept {len(remaining_entries)} scrobble(s) in {scrobble_file.path}{suffix}"
                 )
 
         if stop_processing:
@@ -1823,6 +1938,19 @@ def clear_screen() -> None:
 
 def pause() -> None:
     input("\nPress Enter to continue...")
+
+
+def prompt_retry_count(default: int = 3) -> int:
+    """Ask how many times to re-submit Last.fm-rejected scrobbles (0 disables retries)."""
+    raw = input(
+        f"Retry Last.fm-rejected scrobbles? Retries [{default}, 0 to disable]: "
+    ).strip()
+    if not raw:
+        return default
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return default
 
 
 def prompt_text(label: str, current_value: str, *, secret: bool = False) -> str:
@@ -2181,6 +2309,16 @@ def drive_label(drive: str, config: AppConfig) -> str:
     return drive
 
 
+def overflow_warnings(config: AppConfig, report: ScanReport) -> list[tuple[str, DriveSpaceProjection]]:
+    """Drives the current plan would overflow, surfaced as a pre-sync warning."""
+    warnings: list[tuple[str, DriveSpaceProjection]] = []
+    for drive in (config.internal_drive, config.sd_drive):
+        info = report.space_projection.get(drive)
+        if info is not None and info.shortfall_bytes > 0:
+            warnings.append((drive_label(drive, config), info))
+    return warnings
+
+
 def sample_folder_files(source_dir: str, folder_name: str, limit: int = 10) -> list[str]:
     """Return up to *limit* relative file paths from a source artist folder."""
     folder_root = os.path.join(source_dir, folder_name)
@@ -2494,6 +2632,7 @@ def render_result(title: str, result: SyncResult) -> None:
     safe_print(f"Playlists deleted  : {result.playlists_deleted}")
     safe_print(f"Scrobbles uploaded : {result.scrobbles_uploaded}")
     safe_print(f"Scrobbles ignored  : {result.scrobbles_ignored}")
+    safe_print(f"Scrobbles rejected : {result.scrobbles_rejected}")
     safe_print(f"Logs cleared       : {result.scrobble_logs_cleared}")
     safe_print(f"Folders to internal: {result.artists_internal}")
     safe_print(f"Folders to SD card : {result.artists_sd}")
@@ -2853,15 +2992,35 @@ def run_tui() -> None:
                 lambda progress: sync_library(config, dry_run=True, progress_callback=progress),
             )
             render_result("Sync Preview", preview)
+
+            warnings = overflow_warnings(config, report)
+            if warnings:
+                safe_print("")
+                for label, info in warnings:
+                    safe_print(_red(
+                        f"WARNING: {label} would overflow — short by {human_size(info.shortfall_bytes)} "
+                        f"(need {human_size(info.bytes_to_copy)}, only "
+                        f"{human_size(info.available_after_cleanup or 0)} free after cleanup)."
+                    ))
+                safe_print(_red("Running anyway may fail partway and leave the device partially written."))
+
             confirm = input("\nRun the real sync now? [y/N]: ").strip().lower()
             if confirm != "y":
                 report = scan_library_report(config)
                 continue
 
-            result = run_with_progress(
-                "Sync Running",
-                lambda progress: sync_library(config, dry_run=False, progress_callback=progress),
-            )
+            try:
+                result = run_with_progress(
+                    "Sync Running",
+                    lambda progress: sync_library(config, dry_run=False, progress_callback=progress),
+                )
+            except OSError as exc:
+                clear_screen()
+                safe_print(_red("Sync stopped before finishing: not enough free space."))
+                safe_print(str(exc))
+                report = scan_library_report(config)
+                pause()
+                continue
             render_result("Sync Complete", result)
             report = scan_library_report(config)
             pause()
@@ -2906,9 +3065,12 @@ def run_tui() -> None:
             if confirm != "y":
                 continue
 
+            retries = prompt_retry_count()
             result = run_with_progress(
                 "Scrobble Upload Running",
-                lambda progress: upload_scrobbles(config, dry_run=False, progress_callback=progress),
+                lambda progress: upload_scrobbles(
+                    config, dry_run=False, progress_callback=progress, retries=retries
+                ),
             )
             render_result("Scrobble Upload Complete", result)
             pause()

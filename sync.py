@@ -1489,6 +1489,8 @@ def count_albums_to_remove(
         if scan is None:
             continue
         for folder in scan.artist_folders:
+            if folder in plan.source_artists and folder not in plan.assignments:
+                continue
             if folder not in plan.source_artists or plan.assignments.get(folder) != drive:
                 stale.add(f"{drive}:{folder}")
     return len(stale)
@@ -2384,6 +2386,11 @@ def compute_album_diff(
             # Brand-new album not on any device.
             additions.append((folder, size, planned_drive))
         elif not planned_drive and current:
+            if folder in plan.source_artists:
+                # Source album was skipped because it does not currently fit. Sync keeps
+                # existing device files for skipped albums, so this is not a deletion.
+                unchanged += 1
+                continue
             # Album on a device but gone from source library.
             primary = sorted(current)[0]
             deletions.append((folder, size, primary))

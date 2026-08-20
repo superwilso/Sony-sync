@@ -58,6 +58,10 @@ def save_env_value(key: str, value: str, env_path: str = ".env") -> None:
 
 
 def iter_windows_drives() -> list[str]:
+    # Guarded so this module can be imported (and unit-tested) off Windows; drive detection is
+    # the only Windows-only part of the planner, and everything else works from plain paths.
+    if os.name != "nt":
+        return []
     drives: list[str] = []
     mask = ctypes.windll.kernel32.GetLogicalDrives()
     for index in range(26):
@@ -67,6 +71,8 @@ def iter_windows_drives() -> list[str]:
 
 
 def get_volume_label(drive_root: str) -> str:
+    if os.name != "nt":
+        return ""
     volume_name = ctypes.create_unicode_buffer(261)
     fs_name = ctypes.create_unicode_buffer(261)
     serial = wintypes.DWORD()
@@ -134,6 +140,10 @@ def detect_walkman_paths() -> tuple[str, str]:
 DEFAULT_SOURCE_DIR = r"C:\Users\ABDPa\Music\my music lossless"
 DEFAULT_PLAYLIST_DIR = r"C:\Users\ABDPa\Music\Exported Playlists"
 DEFAULT_INTERNAL_DRIVE, DEFAULT_SD_DRIVE = detect_walkman_paths()
+DEFAULT_SOURCE_DIR = os.environ.get("SYNC_SOURCE_DIR", DEFAULT_SOURCE_DIR)
+DEFAULT_PLAYLIST_DIR = os.environ.get("SYNC_PLAYLIST_DIR", DEFAULT_PLAYLIST_DIR)
+DEFAULT_INTERNAL_DRIVE = os.environ.get("SYNC_INTERNAL_DRIVE", DEFAULT_INTERNAL_DRIVE)
+DEFAULT_SD_DRIVE = os.environ.get("SYNC_SD_DRIVE", DEFAULT_SD_DRIVE)
 DEFAULT_LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
 DEFAULT_LASTFM_API_SECRET = os.environ.get("LASTFM_API_SECRET", "")
 DEFAULT_LASTFM_USERNAME = os.environ.get("LASTFM_USERNAME", "")
@@ -147,6 +157,12 @@ LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 # Supported audio extensions
 AUDIO_EXT = (".flac", ".wav", ".mp3", ".m4a", ".aac", ".alac")
 PLAYLIST_EXT = (".m3u", ".m3u8")
+# Playlists owned by `likesync`, not by this planner. They must be excluded at BOTH ends:
+# as a *source* playlist "Liked Songs" spans the whole library, and the placement algorithm
+# unions every album a playlist touches into one group — one liked list would therefore force
+# the entire library onto a single drive. As a *device* playlist it is not in the plan, so the
+# stale sweep would delete it on the next run. Both are handled by this one set.
+MANAGED_PLAYLISTS = {"liked songs.m3u8", "liked songs.m3u"}
 ALBUM_SELECTION_PAGE_SIZE = 15
 # Parallel workers for the copy phase (I/O-bound on USB flash).
 COPY_WORKERS = 4
@@ -545,7 +561,8 @@ def scan_device(drive_root: str) -> DeviceScan:
                 for fe in folder_entries:
                     scan.files[fe.rel_path] = (fe.size, fe.mtime)
             elif entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(PLAYLIST_EXT):
-                scan.playlists.add(entry.name)
+                if entry.name.lower() not in MANAGED_PLAYLISTS:
+                    scan.playlists.add(entry.name)
         except OSError:
             continue
     return scan
@@ -846,6 +863,7 @@ def list_playlist_files(path: str) -> list[str]:
         name for name in os.listdir(path)
         if os.path.isfile(os.path.join(path, name))
         and name.lower().endswith(PLAYLIST_EXT)
+        and name.lower() not in MANAGED_PLAYLISTS
     )
 
 
@@ -1747,6 +1765,8 @@ def iter_stale_playlists(
             continue
         expected = plan.expected_playlists_by_drive[drive]
         for playlist_name in scan.playlists:
+            if playlist_name.lower() in MANAGED_PLAYLISTS:
+                continue      # likesync owns this file; it is not stale just because we did not write it
             if playlist_name not in expected:
                 stale_playlists.append(os.path.join(drive, playlist_name))
     return stale_playlists
@@ -3100,5 +3120,19 @@ def run_tui() -> None:
         pause()
 
 
+def _main() -> None:
+    """Full-screen front-end by default; `--classic` keeps the original scrolling menu."""
+    if "--classic" in sys.argv[1:]:
+        run_tui()
+        return
+    try:
+        import app
+    except Exception as exc:                      # never leave the user without a UI
+        print(f"full-screen UI unavailable ({exc}); falling back to the classic menu.\n")
+        run_tui()
+        return
+    raise SystemExit(app.main())
+
+
 if __name__ == "__main__":
-    run_tui()
+    _main()
